@@ -7,7 +7,7 @@
 #include <stdio.h>
 
 int main() {
-    const char *inFile = "/Users/saqrag/Downloads/1500471366.mp4";
+    const char *inFile = "/Users/saqrag/Downloads/test.mp4";
     time_t t;
     time(&t);
     char *outFile;
