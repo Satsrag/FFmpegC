@@ -11,7 +11,9 @@ int compress(
         long videoBitRate,
         long audioBitRate,
         int width,
-        int height);
+        int height,
+        int threadCount
+);
 
 void cancelCompress();
 

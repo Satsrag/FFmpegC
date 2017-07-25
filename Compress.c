@@ -104,7 +104,8 @@ static int initOutput(
         long audioBitRate,
         int width,
         int height,
-        char *rotate
+        char *rotate,
+        int threadCount
 ) {
 
     int ret;
@@ -123,6 +124,13 @@ static int initOutput(
         return -101;
     }
 
+    int audioThreadCount = threadCount / 2;
+    int videoThreadCount = threadCount - audioThreadCount;
+    if (audioThreadCount == 0) {
+        audioThreadCount = 2;
+        videoThreadCount = 3;
+    }
+
     AVStream *outStream;
     for (int i = 0; i < 2; ++i) {
         //3. 创建video AVStream
@@ -137,7 +145,7 @@ static int initOutput(
             (*outVideoCodecContext)->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
             (*outVideoCodecContext)->bit_rate = videoBitRate;
             (*outVideoCodecContext)->gop_size = 250;
-            (*outVideoCodecContext)->thread_count = 16;
+            (*outVideoCodecContext)->thread_count = videoThreadCount;
             (*outVideoCodecContext)->time_base.num = inVideoCodecContext->time_base.num;
             (*outVideoCodecContext)->time_base.den = inVideoCodecContext->time_base.den;
             (*outVideoCodecContext)->max_b_frames = 3;
@@ -197,6 +205,7 @@ static int initOutput(
             (*outAudioCodecContext)->codec_id = inAudioCodecContext->codec_id;
             (*outAudioCodecContext)->codec_type = inAudioCodecContext->codec_type;
             (*outAudioCodecContext)->frame_size = inAudioCodecContext->frame_size;
+            (*outAudioCodecContext)->thread_count = audioThreadCount;
             (*outAudioCodecContext)->channel_layout = inAudioCodecContext->channel_layout;
             if (outCodec->channel_layouts) {
                 (*outAudioCodecContext)->channel_layout = outCodec->channel_layouts[0];
@@ -632,7 +641,9 @@ int compress(
         long videoBitRate,
         long audioBitRate,
         int width,
-        int height) {
+        int height,
+        int threadCount
+) {
 
     int ret;
     AVFormatContext *inFormatContext = NULL, *outFormatContext = NULL;
@@ -678,7 +689,8 @@ int compress(
             audioBitRate,
             width,
             height,
-            getRotate(inFormatContext->streams[inVideoIndex])
+            getRotate(inFormatContext->streams[inVideoIndex]),
+            threadCount
     );
     if (ret != 0) {
         LOGE("init output file error");

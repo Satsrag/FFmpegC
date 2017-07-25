@@ -13,7 +13,7 @@ int main() {
     char *outFile;
     outFile = malloc(500);
     sprintf(outFile, "/Users/saqrag/Downloads/%ld.mp4", t);
-    compress(inFile, outFile, 800000, 64000, 854, 480);
+    compress(inFile, outFile, 800000, 64000, 854, 480, 30);
     time_t d;
     time(&d);
     printf("cost time: %ld", d - t);
