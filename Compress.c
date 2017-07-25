@@ -9,77 +9,115 @@
 #include "libavformat/avformat.h"
 #include "Log.h"
 
-int ret = -1;
-AVFormatContext *mInFormatContext, *mOutFormatContext;
-AVCodecContext *mInVideoCodecContext, *mOutVideoCodecContext, *mInAudioCodecContext, *mOutAudioCodecContext;
-AVPacket *mInPacket, *mOutPacket;
-AVFrame *mInFrame, *mOutVideoFrame, *mOutAudioFrame;
-int mInVideoIndex = -1, mInAudioIndex = -1, mOutVideoIndex = -1, mOutAudioIndex = -1;
-struct SwsContext *mSwsContext;
-struct SwrContext *mSwrContext;
+static volatile int mIsCancel = 0;
 
-static int initInput(const char *inFile) {
+static char *getRotate(AVStream *inStream) {
+    AVDictionaryEntry *tag = NULL;
+    tag = av_dict_get(inStream->metadata, "rotate", tag, 0);
+    if (tag == NULL) {
+        return "0";
+    } else {
+        int angle = atoi(tag->value);
+        angle %= 360;
+        if (angle == 90) {
+            return "90";
+        } else if (angle == 180) {
+            return "180";
+        } else if (angle == 270) {
+            return "270";
+        } else {
+            return "0";
+        }
+    }
+}
+
+static int initInput(
+        const char *inFile,
+        AVFormatContext **inFormatContext,
+        AVCodecContext **inVideoCodecContext,
+        AVCodecContext **inAudioCodecContext,
+        int *inVideoIndex,
+        int *inAudioIndex
+) {
+
+    int ret;
 
     //1. 获取AVFormatContext
-    mInFormatContext = avformat_alloc_context();
-    ret = avformat_open_input(&mInFormatContext, inFile, NULL, NULL);
+    *inFormatContext = avformat_alloc_context();
+    ret = avformat_open_input(inFormatContext, inFile, NULL, NULL);
     if (ret != 0) {
         LOGE("open input file: %s error!!", inFile);
         return -1;
     }
 
     //2. 查找AVStream信息，并填充到AVFormatContext
-    ret = avformat_find_stream_info(mInFormatContext, NULL);
+    ret = avformat_find_stream_info(*inFormatContext, NULL);
     if (ret < 0) {
         LOGE("find input AVStream error");
         return -2;
     }
 
     //3. 获取 StreamIndex
-    for (int i = 0; i < mInFormatContext->nb_streams; ++i) {
-        enum AVMediaType type = mInFormatContext->streams[i]->codecpar->codec_type;
+    for (int i = 0; i < (*inFormatContext)->nb_streams; ++i) {
+        enum AVMediaType type = (*inFormatContext)->streams[i]->codecpar->codec_type;
         switch (type) {
             case AVMEDIA_TYPE_VIDEO:
-                mInVideoIndex = i;
-                mInVideoCodecContext = mInFormatContext->streams[mInVideoIndex]->codec;
+                *inVideoIndex = i;
+                *inVideoCodecContext = (*inFormatContext)->streams[i]->codec;
                 AVCodec *videoCodec = avcodec_find_decoder(
-                        mInFormatContext->streams[i]->codecpar->codec_id);
-                avcodec_open2(mInVideoCodecContext, videoCodec, NULL);
+                        (*inFormatContext)->streams[i]->codecpar->codec_id);
+                avcodec_open2(*inVideoCodecContext, videoCodec, NULL);
                 break;
             case AVMEDIA_TYPE_AUDIO:
-                mInAudioIndex = i;
-                mInAudioCodecContext = mInFormatContext->streams[i]->codec;
+                *inAudioIndex = i;
+                *inAudioCodecContext = (*inFormatContext)->streams[i]->codec;
                 AVCodec *audioCodec = avcodec_find_decoder(
-                        mInFormatContext->streams[i]->codecpar->codec_id);
-                avcodec_open2(mInAudioCodecContext, audioCodec, NULL);
+                        (*inFormatContext)->streams[i]->codecpar->codec_id);
+                avcodec_open2(*inAudioCodecContext, audioCodec, NULL);
                 break;
             default:
                 break;
         }
     }
 
-    if (mInVideoIndex == -1) {
+    if (*inVideoIndex == -1) {
         LOGD("not found video Stream");
         return -3;
     }
-    if (mInAudioIndex == -1) {
+    if (*inAudioIndex == -1) {
         LOGD("not found audio Stream");
         return -4;
     }
     return 0;
 }
 
-static int initOutput(const char *outFile) {
+static int initOutput(
+        const char *outFile,
+        AVCodecContext *inVideoCodecContext,
+        AVCodecContext *inAudioCodecContext,
+        AVFormatContext **outFormatContext,
+        AVCodecContext **outVideoCodecContext,
+        AVCodecContext **outAudioCodecContext,
+        int *outVideoIndex,
+        int *outAudioIndex,
+        long videoBitRate,
+        long audioBitRate,
+        int width,
+        int height,
+        char *rotate
+) {
+
+    int ret;
 
     //1. 创建AVFormat
-    ret = avformat_alloc_output_context2(&mOutFormatContext, NULL, NULL, outFile);
+    ret = avformat_alloc_output_context2(outFormatContext, NULL, NULL, outFile);
     if (ret < 0) {
         LOGE("alloc output format context error!");
         return -100;
     }
 
     //2. 创建AVIOContext
-    ret = avio_open(&mOutFormatContext->pb, outFile, AVIO_FLAG_READ_WRITE);
+    ret = avio_open(&(*outFormatContext)->pb, outFile, AVIO_FLAG_READ_WRITE);
     if (ret < 0) {
         LOGE("open output AVIOContext error");
         return -101;
@@ -88,105 +126,108 @@ static int initOutput(const char *outFile) {
     AVStream *outStream;
     for (int i = 0; i < 2; ++i) {
         //3. 创建video AVStream
-        outStream = avformat_new_stream(mOutFormatContext, NULL);
-        outStream->id = mOutFormatContext->nb_streams - 1;
+        outStream = avformat_new_stream(*outFormatContext, NULL);
+        outStream->id = (*outFormatContext)->nb_streams - 1;
 
         if (i == 0) {
-            mOutVideoIndex = outStream->id;
+            *outVideoIndex = outStream->id;
 
             //4. 配置AVCodecContext
-            mOutVideoCodecContext = outStream->codec;
-            mOutVideoCodecContext->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
-            mOutVideoCodecContext->bit_rate = 1000000;
-            mOutVideoCodecContext->gop_size = 250;
-            mOutVideoCodecContext->thread_count = 16;
-            mOutVideoCodecContext->time_base.num = mInVideoCodecContext->time_base.num;
-            mOutVideoCodecContext->time_base.den = mInVideoCodecContext->time_base.den;
-            mOutVideoCodecContext->max_b_frames = 3;
-            mOutVideoCodecContext->codec_id = AV_CODEC_ID_H264;
-            mOutVideoCodecContext->codec_type = AVMEDIA_TYPE_VIDEO;
-            mOutVideoCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
-            mOutVideoCodecContext->width = 854;
-            mOutVideoCodecContext->height = 480;
+            *outVideoCodecContext = outStream->codec;
+            (*outVideoCodecContext)->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
+            (*outVideoCodecContext)->bit_rate = videoBitRate;
+            (*outVideoCodecContext)->gop_size = 250;
+            (*outVideoCodecContext)->thread_count = 16;
+            (*outVideoCodecContext)->time_base.num = inVideoCodecContext->time_base.num;
+            (*outVideoCodecContext)->time_base.den = inVideoCodecContext->time_base.den;
+            (*outVideoCodecContext)->max_b_frames = 3;
+            (*outVideoCodecContext)->codec_id = AV_CODEC_ID_H264;
+            (*outVideoCodecContext)->codec_type = AVMEDIA_TYPE_VIDEO;
+            (*outVideoCodecContext)->pix_fmt = AV_PIX_FMT_YUV420P;
+            (*outVideoCodecContext)->width = width;
+            (*outVideoCodecContext)->height = height;
 
             //H264
-            mOutVideoCodecContext->me_range = 16;
-            mOutVideoCodecContext->max_qdiff = 4;
-            mOutVideoCodecContext->qcompress = 0.6;
-            mOutVideoCodecContext->qmin = 10;
-            mOutVideoCodecContext->qmax = 51;
+            (*outVideoCodecContext)->me_range = 16;
+            (*outVideoCodecContext)->max_qdiff = 4;
+            (*outVideoCodecContext)->qcompress = 0.6;
+            (*outVideoCodecContext)->qmin = 10;
+            (*outVideoCodecContext)->qmax = 51;
+
+            av_dict_set(&(*outFormatContext)->streams[*outVideoIndex]->metadata, "rotate", rotate,
+                        0);
 
             // Set Option
             AVDictionary *param = 0;
             //H.264
-            if (mOutVideoCodecContext->codec_id == AV_CODEC_ID_H264) {
-                av_opt_set(mOutVideoCodecContext->priv_data, "preset", "ultrafast", 0);
+            if ((*outVideoCodecContext)->codec_id == AV_CODEC_ID_H264) {
+                av_opt_set((*outVideoCodecContext)->priv_data, "preset", "ultrafast", 0);
                 av_dict_set(&param, "profile", "baseline", 0);
             }
 
             //Show some Information
-            av_dump_format(mOutFormatContext, 0, outFile, 1);
+            av_dump_format(*outFormatContext, 0, outFile, 1);
 
             //5. 配置AVCodec
             AVCodec *outCodec = NULL;
-            outCodec = avcodec_find_encoder(mOutVideoCodecContext->codec_id);
+            outCodec = avcodec_find_encoder((*outVideoCodecContext)->codec_id);
             if (outCodec == NULL) {
                 LOGE("find AVCodec error!");
                 return -103;
             }
-            ret = avcodec_open2(mOutVideoCodecContext, outCodec, &param);
+            ret = avcodec_open2(*outVideoCodecContext, outCodec, &param);
             if (ret != 0) {
                 LOGE("open codec error");
                 return -104;
             }
         } else {
-            mOutAudioIndex = outStream->id;
+            *outAudioIndex = outStream->id;
 
             //1. find encoder
             AVCodec *outCodec = NULL;
-            outCodec = avcodec_find_encoder(mInAudioCodecContext->codec_id);
+            outCodec = avcodec_find_encoder(inAudioCodecContext->codec_id);
             if (outCodec == NULL) {
                 LOGE("find audio AVCodec error!");
                 return -105;
             }
 
             //2. setting encoder context
-            mOutAudioCodecContext = outStream->codec;
-            mOutAudioCodecContext->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
-            mOutAudioCodecContext->codec_id = mInAudioCodecContext->codec_id;
-            mOutAudioCodecContext->codec_type = mInAudioCodecContext->codec_type;
-            mOutAudioCodecContext->frame_size = mInAudioCodecContext->frame_size;
-            mOutAudioCodecContext->channel_layout = mInAudioCodecContext->channel_layout;
+            *outAudioCodecContext = outStream->codec;
+            (*outAudioCodecContext)->flags = AV_CODEC_FLAG_GLOBAL_HEADER;
+            (*outAudioCodecContext)->codec_id = inAudioCodecContext->codec_id;
+            (*outAudioCodecContext)->codec_type = inAudioCodecContext->codec_type;
+            (*outAudioCodecContext)->frame_size = inAudioCodecContext->frame_size;
+            (*outAudioCodecContext)->channel_layout = inAudioCodecContext->channel_layout;
             if (outCodec->channel_layouts) {
-                mOutAudioCodecContext->channel_layout = outCodec->channel_layouts[0];
+                (*outAudioCodecContext)->channel_layout = outCodec->channel_layouts[0];
                 for (int a = 0; outCodec->channel_layouts[a]; a++) {
-                    if (outCodec->channel_layouts[a] == mInAudioCodecContext->channel_layout) {
-                        mOutAudioCodecContext->channel_layout = mInAudioCodecContext->channel_layout;
+                    if (outCodec->channel_layouts[a] == inAudioCodecContext->channel_layout) {
+                        (*outAudioCodecContext)->channel_layout = inAudioCodecContext->channel_layout;
                     }
                 }
             }
-            mOutAudioCodecContext->channels = av_get_channel_layout_nb_channels(
-                    mOutAudioCodecContext->channel_layout
+            (*outAudioCodecContext)->channels = av_get_channel_layout_nb_channels(
+                    (*outAudioCodecContext)->channel_layout
             );
-            mOutAudioCodecContext->sample_fmt = mInAudioCodecContext->sample_fmt;
+            (*outAudioCodecContext)->sample_fmt = inAudioCodecContext->sample_fmt;
             if (outCodec->sample_fmts) {
-                mOutAudioCodecContext->sample_fmt = outCodec->sample_fmts[0];
+                (*outAudioCodecContext)->sample_fmt = outCodec->sample_fmts[0];
                 for (int b = 0; outCodec->sample_fmts[b]; b++) {
-                    if (outCodec->sample_fmts[b] == mInAudioCodecContext->sample_fmt) {
-                        mOutAudioCodecContext->sample_fmt = mInAudioCodecContext->sample_fmt;
+                    if (outCodec->sample_fmts[b] == inAudioCodecContext->sample_fmt) {
+                        (*outAudioCodecContext)->sample_fmt = inAudioCodecContext->sample_fmt;
                     }
                 }
             }
-            LOGD("channel layout: %lld", mOutAudioCodecContext->channel_layout);
-            LOGD("channels :%d", mOutAudioCodecContext->channels);
-            LOGD("sample_fmts: %d", mOutAudioCodecContext->sample_fmt);
-            mOutAudioCodecContext->sample_rate = mInAudioCodecContext->sample_rate;
-            mOutAudioCodecContext->bit_rate = 64000;
+            LOGD("channel layout: %ld", (*outAudioCodecContext)->channel_layout);
+            LOGD("channels :%d", (*outAudioCodecContext)->channels);
+            LOGD("sample_fmts: %d", (*outAudioCodecContext)->sample_fmt);
+            (*outAudioCodecContext)->sample_rate = inAudioCodecContext->sample_rate;
+            (*outAudioCodecContext)->bit_rate = audioBitRate;
 
 //          Show some Information
-            av_dump_format(mOutFormatContext, 0, outFile, 1);
+            av_dump_format(*outFormatContext, 0, outFile, 1);
 
-            ret = avcodec_open2(mOutAudioCodecContext, outCodec, NULL);
+            ret = avcodec_open2(*outAudioCodecContext, outCodec, NULL);
             if (ret != 0) {
                 LOGE("open audio codec error, CODE: %d", ret);
                 return -106;
@@ -196,37 +237,39 @@ static int initOutput(const char *outFile) {
     return 0;
 }
 
-static int initAudioFrame() {
+static int initAudioFrame(
+        AVCodecContext *inAudioCodecContext,
+        AVCodecContext *outAudioCodecContext,
+        AVFrame **outAudioFrame,
+        SwrContext **swrContext
+) {
 
-    mOutAudioFrame = av_frame_alloc();
-    if (mOutAudioFrame == NULL) {
+    int ret;
+
+    *outAudioFrame = av_frame_alloc();
+    if (*outAudioFrame == NULL) {
         LOGE("alloc out audio frame error");
         return -500;
     }
 
-    if (ret < 0) {
-        LOGE("alloc out audio frame sample error, CODE: %d", ret);
-        return -501;
-    }
-
-    mSwrContext = swr_alloc_set_opts(
+    *swrContext = swr_alloc_set_opts(
             NULL,
-            mOutAudioCodecContext->channel_layout,
-            mOutAudioCodecContext->sample_fmt,
-            mOutAudioCodecContext->sample_rate,
-            mInAudioCodecContext->channel_layout,
-            mInAudioCodecContext->sample_fmt,
-            mInAudioCodecContext->sample_rate,
+            outAudioCodecContext->channel_layout,
+            outAudioCodecContext->sample_fmt,
+            outAudioCodecContext->sample_rate,
+            inAudioCodecContext->channel_layout,
+            inAudioCodecContext->sample_fmt,
+            inAudioCodecContext->sample_rate,
             0,
             NULL
     );
 
-    if (!mSwrContext) {
+    if (!*swrContext) {
         LOGE("create mSwrContext error");
         return -502;
     }
 
-    ret = swr_init(mSwrContext);
+    ret = swr_init(*swrContext);
     if (ret < 0) {
         LOGE("init SwrContext error, CODE: %d", ret);
         return -503;
@@ -235,20 +278,35 @@ static int initAudioFrame() {
     return 0;
 }
 
-static int transCodeVideo() {
+static int transCodeVideo(
+        AVFormatContext *inFormatContext,
+        AVFormatContext *outFormatContext,
+        AVCodecContext *inVideoCodecContext,
+        AVCodecContext *outVideoCodecContext,
+        AVPacket *inPacket,
+        AVPacket *outPacket,
+        AVFrame *inFrame,
+        AVFrame *outVideoFrame,
+        struct SwsContext *swsContext,
+        int *inVideoIndex,
+        int *outVideoIndex
+) {
+
+    int ret;
+
     uint8_t *out_buffer = (unsigned char *) av_malloc((size_t) av_image_get_buffer_size(
             AV_PIX_FMT_YUV420P,
-            mOutVideoCodecContext->width,
-            mOutVideoCodecContext->height,
+            outVideoCodecContext->width,
+            outVideoCodecContext->height,
             1
     ));
     av_image_fill_arrays(
-            mOutVideoFrame->data,
-            mOutVideoFrame->linesize,
+            outVideoFrame->data,
+            outVideoFrame->linesize,
             out_buffer,
             AV_PIX_FMT_YUV420P,
-            mOutVideoCodecContext->width,
-            mOutVideoCodecContext->height,
+            outVideoCodecContext->width,
+            outVideoCodecContext->height,
             1
     );
 
@@ -256,27 +314,27 @@ static int transCodeVideo() {
 
     LOGD(
             ">>>>in stream time base num: %d den: %d<<<<",
-            mInFormatContext->streams[mInVideoIndex]->time_base.num,
-            mInFormatContext->streams[mInVideoIndex]->time_base.den
+            inFormatContext->streams[*inVideoIndex]->time_base.num,
+            inFormatContext->streams[*inVideoIndex]->time_base.den
     );
 
-    LOGD(">>>>in packet pts: %lld dts: %lld<<<<", mInPacket->pts, mInPacket->dts);
+    LOGD(">>>>in packet pts: %lld dts: %lld<<<<", inPacket->pts, inPacket->dts);
 
-    mInPacket->pts = av_rescale_q(
-            mInPacket->pts,
-            mInFormatContext->streams[mInVideoIndex]->time_base,
-            mInVideoCodecContext->time_base
+    inPacket->pts = av_rescale_q(
+            inPacket->pts,
+            inFormatContext->streams[*inVideoIndex]->time_base,
+            inVideoCodecContext->time_base
     );
-    mInPacket->dts = mInPacket->pts;
+    inPacket->dts = inPacket->pts;
 
     //1. 解码
-    ret = avcodec_send_packet(mInVideoCodecContext, mInPacket);
+    ret = avcodec_send_packet(inVideoCodecContext, inPacket);
     if (ret != 0) {
         LOGE("send decode packet error");
         return -200;
     }
 
-    ret = avcodec_receive_frame(mInVideoCodecContext, mInFrame);
+    ret = avcodec_receive_frame(inVideoCodecContext, inFrame);
     if (ret != 0) {
         LOGE("receive decode frame error");
         return -201;
@@ -284,72 +342,70 @@ static int transCodeVideo() {
 
     LOGD(
             ">>>>in codec context time base num: %d den: %d<<<<",
-            mInVideoCodecContext->time_base.num,
-            mInVideoCodecContext->time_base.den
+            inVideoCodecContext->time_base.num,
+            inVideoCodecContext->time_base.den
     );
 
-    LOGD(">>>>in frame pts: %lld<<<<", mInFrame->pts);
+    LOGD(">>>>in frame pts: %lld<<<<", inFrame->pts);
 
     sws_scale(
-            mSwsContext,
-            (const uint8_t *const *) mInFrame->data,
-            mInFrame->linesize, 0,
-            mInFrame->height,
-            mOutVideoFrame->data,
-            mOutVideoFrame->linesize
+            swsContext,
+            (const uint8_t *const *) inFrame->data,
+            inFrame->linesize, 0,
+            inFrame->height,
+            outVideoFrame->data,
+            outVideoFrame->linesize
     );
 
-//    mInFrame->pts = av_frame_get_best_effort_timestamp(mInFrame);
-
-    mOutVideoFrame->format = mInFrame->format;
-    mOutVideoFrame->width = mOutVideoCodecContext->width;
-    mOutVideoFrame->height = mOutVideoCodecContext->height;
-    mOutVideoFrame->pts = av_rescale_q(mInFrame->pts, mInVideoCodecContext->time_base,
-                                       mOutVideoCodecContext->time_base);
+    outVideoFrame->format = inFrame->format;
+    outVideoFrame->width = outVideoCodecContext->width;
+    outVideoFrame->height = outVideoCodecContext->height;
+    outVideoFrame->pts = av_rescale_q(inFrame->pts, inVideoCodecContext->time_base,
+                                      outVideoCodecContext->time_base);
 
     LOGD(
             "<<<<out codec context time base num: %d den: %d>>>>",
-            mOutVideoCodecContext->time_base.num,
-            mOutVideoCodecContext->time_base.den
+            outVideoCodecContext->time_base.num,
+            outVideoCodecContext->time_base.den
     );
 
-    LOGD("<<<<out packet pts: %lld>>>>", mOutVideoFrame->pts);
+    LOGD("<<<<out packet pts: %lld>>>>", outVideoFrame->pts);
 
 
-    ret = avcodec_send_frame(mOutVideoCodecContext, mOutVideoFrame);
+    ret = avcodec_send_frame(outVideoCodecContext, outVideoFrame);
     if (ret != 0) {
         LOGE("send encode frame error, CODE: %d", ret);
         return -203;
     }
 
 
-    mOutPacket->data = NULL;
-    mOutPacket->size = 0;
+    outPacket->data = NULL;
+    outPacket->size = 0;
 
-    ret = avcodec_receive_packet(mOutVideoCodecContext, mOutPacket);
+    ret = avcodec_receive_packet(outVideoCodecContext, outPacket);
     if (ret != 0) {
         LOGE("receive encode packet error, CODE: %d", ret);
         return -203;
     }
 
-    mOutPacket->pts = av_rescale_q(
-            mOutPacket->pts,
-            mOutVideoCodecContext->time_base,
-            mOutFormatContext->streams[mOutVideoIndex]->time_base
+    outPacket->pts = av_rescale_q(
+            outPacket->pts,
+            outVideoCodecContext->time_base,
+            outFormatContext->streams[*outVideoIndex]->time_base
     );
-    mOutPacket->dts = mOutPacket->pts;
-    mOutPacket->stream_index = mOutVideoIndex;
+    outPacket->dts = outPacket->pts;
+    outPacket->stream_index = *outVideoIndex;
 
     LOGD(
             "<<<<out stream time base num: %d den: %d>>>>",
-            mOutFormatContext->streams[mOutVideoIndex]->time_base.num,
-            mOutFormatContext->streams[mOutVideoIndex]->time_base.den
+            outFormatContext->streams[*outVideoIndex]->time_base.num,
+            outFormatContext->streams[*outVideoIndex]->time_base.den
     );
 
-    LOGD("<<<<out packet pts: %lld dts: %lld>>>>", mOutPacket->pts, mOutPacket->dts);
+    LOGD("<<<<out packet pts: %lld dts: %lld>>>>", outPacket->pts, outPacket->dts);
 
     //3. 写入 AVFormatContext
-    ret = av_interleaved_write_frame(mOutFormatContext, mOutPacket);
+    ret = av_interleaved_write_frame(outFormatContext, outPacket);
 
     if (ret < 0) {
         LOGE("write frame error, CODE: %d", ret);
@@ -361,33 +417,47 @@ static int transCodeVideo() {
     return 0;
 }
 
-static int transCodeAudio() {
+static int transCodeAudio(
+        AVFormatContext *inFormatContext,
+        AVFormatContext *outFormatContext,
+        AVCodecContext *inAudioCodecContext,
+        AVCodecContext *outAudioCodecContext,
+        AVPacket *inPacket,
+        AVPacket *outPacket,
+        AVFrame *inFrame,
+        AVFrame *outAudioFrame,
+        SwrContext *swrContext,
+        int *inAudioIndex,
+        int *outAudioIndex
+) {
+
+    int ret;
 
     LOGD("------------------------------start audio trans code-------------------------------------");
 
     LOGD(
             ">>>>in stream time base num: %d den: %d<<<<",
-            mInFormatContext->streams[mInAudioIndex]->time_base.num,
-            mInFormatContext->streams[mInAudioIndex]->time_base.den
+            inFormatContext->streams[*inAudioIndex]->time_base.num,
+            inFormatContext->streams[*inAudioIndex]->time_base.den
     );
 
-    LOGD(">>>>in packet pts: %lld dts: %lld<<<<", mInPacket->pts, mInPacket->dts);
+    LOGD(">>>>in packet pts: %lld dts: %lld<<<<", inPacket->pts, inPacket->dts);
 
-    mInPacket->pts = av_rescale_q(
-            mInPacket->pts,
-            mInFormatContext->streams[mInAudioIndex]->time_base,
-            mInAudioCodecContext->time_base
+    inPacket->pts = av_rescale_q(
+            inPacket->pts,
+            inFormatContext->streams[*inAudioIndex]->time_base,
+            inAudioCodecContext->time_base
     );
-    mInPacket->dts = mInPacket->pts;
+    inPacket->dts = inPacket->pts;
 
     //1. 解码
-    ret = avcodec_send_packet(mInAudioCodecContext, mInPacket);
+    ret = avcodec_send_packet(inAudioCodecContext, inPacket);
     if (ret != 0) {
         LOGE("send decode packet error");
         return -200;
     }
 
-    ret = avcodec_receive_frame(mInAudioCodecContext, mInFrame);
+    ret = avcodec_receive_frame(inAudioCodecContext, inFrame);
     if (ret != 0) {
         LOGE("receive decode frame error");
         return -201;
@@ -395,27 +465,27 @@ static int transCodeAudio() {
 
     LOGD(
             ">>>>in codec context time base num: %d den: %d<<<<",
-            mInAudioCodecContext->time_base.num,
-            mInAudioCodecContext->time_base.den
+            inAudioCodecContext->time_base.num,
+            inAudioCodecContext->time_base.den
     );
 
-    LOGD(">>>>in frame pts: %lld<<<<", mInFrame->pts);
+    LOGD(">>>>in frame pts: %lld<<<<", inFrame->pts);
 
     int tempOutAudioSampleCount = (int) av_rescale_rnd(
-            swr_get_delay(mSwrContext, mInAudioCodecContext->sample_rate) +
-            mInFrame->nb_samples,
-            mOutAudioCodecContext->sample_rate,
-            mInAudioCodecContext->sample_rate,
+            swr_get_delay(swrContext, inAudioCodecContext->sample_rate) +
+            inFrame->nb_samples,
+            outAudioCodecContext->sample_rate,
+            inAudioCodecContext->sample_rate,
             AV_ROUND_UP
     );
 
-    int channelCount = av_get_channel_layout_nb_channels(mOutAudioCodecContext->channel_layout);
+    int channelCount = av_get_channel_layout_nb_channels(outAudioCodecContext->channel_layout);
     ret = av_samples_alloc(
-            mOutAudioFrame->data,
-            mOutAudioFrame->linesize,
+            outAudioFrame->data,
+            outAudioFrame->linesize,
             channelCount,
             tempOutAudioSampleCount,
-            mOutAudioCodecContext->sample_fmt,
+            outAudioCodecContext->sample_fmt,
             0
     );
     if (ret < 0) {
@@ -424,62 +494,62 @@ static int transCodeAudio() {
     }
 
     ret = swr_convert(
-            mSwrContext,
-            mOutAudioFrame->data,
-            mOutAudioFrame->nb_samples,
-            (const uint8_t **) mInFrame->data,
-            mInFrame->nb_samples
+            swrContext,
+            outAudioFrame->data,
+            outAudioFrame->nb_samples,
+            (const uint8_t **) inFrame->data,
+            inFrame->nb_samples
     );
     if (ret < 0) {
         LOGD("swr_convert error: %d", ret);
         return -203;
     }
 
-    mOutAudioFrame->pts = av_rescale_q(
-            mInFrame->pts,
-            mInAudioCodecContext->time_base,
-            mOutAudioCodecContext->time_base
+    outAudioFrame->pts = av_rescale_q(
+            inFrame->pts,
+            inAudioCodecContext->time_base,
+            outAudioCodecContext->time_base
     );
-    mOutAudioFrame->nb_samples = tempOutAudioSampleCount;
-    mOutAudioFrame->channel_layout = mOutAudioCodecContext->channel_layout;
-    mOutAudioFrame->format = mOutAudioCodecContext->sample_fmt;
-    mOutAudioFrame->sample_rate = mOutAudioCodecContext->sample_rate;
+    outAudioFrame->nb_samples = tempOutAudioSampleCount;
+    outAudioFrame->channel_layout = outAudioCodecContext->channel_layout;
+    outAudioFrame->format = outAudioCodecContext->sample_fmt;
+    outAudioFrame->sample_rate = outAudioCodecContext->sample_rate;
 
-    ret = avcodec_send_frame(mOutAudioCodecContext, mOutAudioFrame);
+    ret = avcodec_send_frame(outAudioCodecContext, outAudioFrame);
     if (ret != 0) {
         LOGE("send encode frame error, CODE: %d", ret);
         return -203;
     }
 
-    mOutPacket->data = NULL;
-    mOutPacket->size = 0;
+    outPacket->data = NULL;
+    outPacket->size = 0;
 
-    ret = avcodec_receive_packet(mOutAudioCodecContext, mOutPacket);
+    ret = avcodec_receive_packet(outAudioCodecContext, outPacket);
     if (ret != 0) {
         LOGE("receive encode packet error, CODE: %d", ret);
         return -203;
     }
 
-    av_freep(mOutAudioFrame->data);
+    av_freep(outAudioFrame->data);
 
-    mOutPacket->pts = av_rescale_q(
-            mOutPacket->pts,
-            mOutAudioCodecContext->time_base,
-            mOutFormatContext->streams[mOutAudioIndex]->time_base
+    outPacket->pts = av_rescale_q(
+            outPacket->pts,
+            outAudioCodecContext->time_base,
+            outFormatContext->streams[*outAudioIndex]->time_base
     );
-    mOutPacket->dts = mOutPacket->pts;
-    mOutPacket->stream_index = mOutAudioIndex;
+    outPacket->dts = outPacket->pts;
+    outPacket->stream_index = *outAudioIndex;
 
     LOGD(
             "<<<<out stream time base num: %d den: %d>>>>",
-            mOutFormatContext->streams[mOutAudioIndex]->time_base.num,
-            mOutFormatContext->streams[mOutAudioIndex]->time_base.den
+            outFormatContext->streams[*outAudioIndex]->time_base.num,
+            outFormatContext->streams[*outAudioIndex]->time_base.den
     );
 
-    LOGD("<<<<out packet pts: %lld dts: %lld>>>>", mOutPacket->pts, mOutPacket->dts);
+    LOGD("<<<<out packet pts: %lld dts: %lld>>>>", outPacket->pts, outPacket->dts);
 
 //3. 写入 AVFormatContext
-    ret = av_interleaved_write_frame(mOutFormatContext, mOutPacket);
+    ret = av_interleaved_write_frame(outFormatContext, outPacket);
 
     if (ret < 0) {
         LOGE("write frame error, CODE: %d", ret);
@@ -490,7 +560,12 @@ static int transCodeAudio() {
     return 0;
 }
 
-static int flushEncoder(AVCodecContext *outCodecContext, unsigned int stream_index) {
+static int flushEncoder(
+        AVFormatContext *outFormatContext,
+        AVCodecContext *outCodecContext,
+        AVPacket *outPacket,
+        unsigned int streamIndex
+) {
     int ret;
     if (!(outCodecContext->codec->capabilities & CODEC_CAP_DELAY)) {
         return 0;
@@ -503,133 +578,233 @@ static int flushEncoder(AVCodecContext *outCodecContext, unsigned int stream_ind
     }
 
     while (1) {
-        mOutPacket->data = NULL;
-        mOutPacket->size = 0;
-        av_init_packet(mOutPacket);
+        outPacket->data = NULL;
+        outPacket->size = 0;
+        av_init_packet(outPacket);
 
 
-        ret = avcodec_receive_packet(outCodecContext, mOutPacket);
+        ret = avcodec_receive_packet(outCodecContext, outPacket);
         if (ret != 0) {
             LOGD("receive packet error, CODE: %d", ret);
             break;
         }
 
-        LOGD("------------------------------start %d mux----------------------", stream_index);
+        LOGD("------------------------------start %d mux----------------------", streamIndex);
         LOGD(
                 "<<<<out stream time base num: %d den: %d>>>>",
-                mOutFormatContext->streams[mOutAudioIndex]->time_base.num,
-                mOutFormatContext->streams[mOutAudioIndex]->time_base.den
+                outFormatContext->streams[streamIndex]->time_base.num,
+                outFormatContext->streams[streamIndex]->time_base.den
         );
-        LOGD("<<<<out packet pts: %lld dts: %lld>>>>", mOutPacket->pts, mOutPacket->dts);
+        LOGD("<<<<out packet pts: %lld dts: %lld>>>>", outPacket->pts, outPacket->dts);
 
-        mOutPacket->pts = av_rescale_q(
-                mOutPacket->pts,
+        outPacket->pts = av_rescale_q(
+                outPacket->pts,
                 outCodecContext->time_base,
-                mOutFormatContext->streams[stream_index]->time_base
+                outFormatContext->streams[streamIndex]->time_base
         );
-        mOutPacket->dts = mOutPacket->pts;
-        mOutPacket->stream_index = stream_index;
+        outPacket->dts = outPacket->pts;
+        outPacket->stream_index = streamIndex;
 
 
         LOGD(
                 "<<<<out stream time base num: %d den: %d>>>>",
-                mOutFormatContext->streams[mOutAudioIndex]->time_base.num,
-                mOutFormatContext->streams[mOutAudioIndex]->time_base.den
+                outFormatContext->streams[streamIndex]->time_base.num,
+                outFormatContext->streams[streamIndex]->time_base.den
         );
 
-        LOGD("<<<<out packet pts: %lld dts: %lld>>>>", mOutPacket->pts, mOutPacket->dts);
-        ret = av_interleaved_write_frame(mOutFormatContext, mOutPacket);
-        LOGD("------------------------------end %d mux----------------------", stream_index);
+        LOGD("<<<<out packet pts: %lld dts: %lld>>>>", outPacket->pts, outPacket->dts);
+        ret = av_interleaved_write_frame(outFormatContext, outPacket);
+        LOGD("------------------------------end %d mux----------------------", streamIndex);
 
         if (ret != 0) {
             LOGD("write frame error");
             break;
         }
 
-        LOGD("Flush Encoder: Succeed to encode 1 frame!\tsize:%5d\n", mOutPacket->size);
+        LOGD("Flush Encoder: Succeed to encode 1 frame!\tsize:%5d\n", outPacket->size);
     }
     return 0;
 }
 
-int compress(const char *in_filename, const char *out_filename) {
+int compress(
+        const char *inFilename,
+        const char *outFilename,
+        long videoBitRate,
+        long audioBitRate,
+        int width,
+        int height) {
 
-    //1. 注册
+    int ret;
+    AVFormatContext *inFormatContext = NULL, *outFormatContext = NULL;
+    AVCodecContext *inVideoCodecContext, *outVideoCodecContext = NULL, *inAudioCodecContext, *outAudioCodecContext = NULL;
+    AVPacket *inPacket = NULL, *outPacket = NULL;
+    AVFrame *inFrame = NULL, *outVideoFrame = NULL, *outAudioFrame = NULL;
+    int inVideoIndex = -1, inAudioIndex = -1, outVideoIndex = -1, outAudioIndex = -1;
+    struct SwsContext *swsContext = NULL;
+    struct SwrContext *swrContext = NULL;
+
+    mIsCancel = 1;
+
+//1. 注册
     av_register_all();
 
-    //2. 初始化input
-    ret = initInput(in_filename);
+//2. 初始化input
+    ret = initInput(
+            inFilename,
+            &inFormatContext,
+            &inVideoCodecContext,
+            &inAudioCodecContext,
+            &inVideoIndex,
+            &inAudioIndex
+    );
     if (ret != 0) {
         LOGE("init input File error!!");
         goto end;
     }
 
-    //3. 初始化output
-    ret = initOutput(out_filename);
+    LOGE("rotate: %s", getRotate(inFormatContext->streams[inVideoIndex]));
+
+//3. 初始化output
+    ret = initOutput(
+            outFilename,
+            inVideoCodecContext,
+            inAudioCodecContext,
+            &outFormatContext,
+            &outVideoCodecContext,
+            &outAudioCodecContext,
+            &outVideoIndex,
+            &outAudioIndex,
+            videoBitRate,
+            audioBitRate,
+            width,
+            height,
+            getRotate(inFormatContext->streams[inVideoIndex])
+    );
     if (ret != 0) {
         LOGE("init output file error");
         goto end;
     }
 
-    //4. AVPacket 申请内存
-    mInPacket = av_packet_alloc();
-    mOutPacket = av_packet_alloc();
+//4. AVPacket 申请内存
+    inPacket = av_packet_alloc();
+    outPacket = av_packet_alloc();
 
 
-    //5. AVFrame 申请内存
-    mInFrame = av_frame_alloc();
-    mOutVideoFrame = av_frame_alloc();
+//5. AVFrame 申请内存
+    inFrame = av_frame_alloc();
+    outVideoFrame = av_frame_alloc();
 
-    //6. 写头
-    avformat_write_header(mOutFormatContext, NULL);
+//6. 写头
+    avformat_write_header(outFormatContext, NULL);
 
-    mSwsContext = sws_getContext(
-            mInVideoCodecContext->width,
-            mInVideoCodecContext->height,
+    swsContext = sws_getContext(
+            inVideoCodecContext->width,
+            inVideoCodecContext->height,
             AV_PIX_FMT_YUV420P,
-            mOutVideoCodecContext->width,
-            mOutVideoCodecContext->height,
-            AV_PIX_FMT_YUV420P, SWS_BICUBIC,
-            NULL, NULL, NULL
+            outVideoCodecContext->width,
+            outVideoCodecContext->height,
+            AV_PIX_FMT_YUV420P,
+            SWS_BICUBIC,
+            NULL,
+            NULL,
+            NULL
     );
-    if (mSwsContext == NULL) {
+    if (swsContext == NULL) {
         LOGE("getSwsContext error");
         goto end;
     }
 
-    initAudioFrame();
+    initAudioFrame(inAudioCodecContext, outAudioCodecContext, &outAudioFrame, &swrContext);
 
-    while (av_read_frame(mInFormatContext, mInPacket) == 0) {
-        if (mInPacket->stream_index == mInVideoIndex) {
-            ret = transCodeVideo();
-        } else if (mInPacket->stream_index == mInAudioIndex) {
-            ret = transCodeAudio();
+    while (av_read_frame(inFormatContext, inPacket) == 0) {
+        LOGE("mIsCancel: %d", mIsCancel);
+        if (mIsCancel == 0) break;
+
+        if (inPacket->stream_index == inVideoIndex) {
+            transCodeVideo(
+                    inFormatContext,
+                    outFormatContext,
+                    inVideoCodecContext,
+                    outVideoCodecContext,
+                    inPacket,
+                    outPacket,
+                    inFrame,
+                    outVideoFrame,
+                    swsContext,
+                    &inVideoIndex,
+                    &outVideoIndex);
+        } else if (inPacket->stream_index == inAudioIndex) {
+            transCodeAudio(
+                    inFormatContext,
+                    outFormatContext,
+                    inAudioCodecContext,
+                    outAudioCodecContext,
+                    inPacket,
+                    outPacket,
+                    inFrame,
+                    outAudioFrame,
+                    swrContext,
+                    &inAudioIndex,
+                    &outAudioIndex);
         }
-        av_packet_unref(mInPacket);
-        av_packet_unref(mOutPacket);
+        av_packet_unref(inPacket);
+        av_packet_unref(outPacket);
     }
 
-    flushEncoder(mOutVideoCodecContext, (unsigned int) mOutVideoIndex);
-    flushEncoder(mOutAudioCodecContext, (unsigned int) mOutAudioIndex);
-
-    ret = av_write_trailer(mOutFormatContext);
-    if (ret != 0) {
-        LOGE("write trailer error");
+    if (mIsCancel != 0) {
+        flushEncoder(outFormatContext, outVideoCodecContext, outPacket,
+                     (unsigned int) outVideoIndex);
+        flushEncoder(outFormatContext, outAudioCodecContext, outPacket,
+                     (unsigned int) outAudioIndex);
+        ret = av_write_trailer(outFormatContext);
+        if (ret != 0) {
+            LOGE("write trailer error");
+            goto end;
+        }
+    } else {
+        ret = -100;
         goto end;
     }
-    return 0;
+
+    ret = 0;
 
     end:
-    av_frame_free(&mInFrame);
-    av_frame_free(&mOutVideoFrame);
-    av_packet_free(&mInPacket);
-    av_packet_free(&mOutPacket);
-    sws_freeContext(mSwsContext);
-    swr_free(&mSwrContext);
-    avcodec_close(mInVideoCodecContext);
-    avcodec_close(mOutVideoCodecContext);
-    avformat_close_input(&mInFormatContext);
-    avformat_free_context(mInFormatContext);
-    avformat_close_input(&mOutFormatContext);
-    avformat_free_context(mOutFormatContext);
-    return -10;
+    if (inFrame != NULL) {
+        av_frame_free(&inFrame);
+    }
+    if (outVideoFrame != NULL) {
+        av_frame_free(&outVideoFrame);
+    }
+    if (outAudioFrame != NULL) {
+        av_frame_free(&outAudioFrame);
+    }
+    if (inPacket != NULL) {
+        av_packet_free(&inPacket);
+    }
+    if (outPacket != NULL) {
+        av_packet_free(&outPacket);
+    }
+    sws_freeContext(swsContext);
+    if (swrContext != NULL) {
+        swr_free(&swrContext);
+    }
+    avcodec_close(inVideoCodecContext);
+    avcodec_close(outVideoCodecContext);
+    avcodec_close(inAudioCodecContext);
+    avcodec_close(outAudioCodecContext);
+    if (inFormatContext != NULL) {
+        avformat_close_input(&inFormatContext);
+        avformat_free_context(inFormatContext);
+    }
+    if (outFormatContext != NULL) {
+        avformat_close_input(&outFormatContext);
+        avformat_free_context(outFormatContext);
+    }
+    return ret;
+}
+
+void cancelCompress() {
+    LOGE("before cancel: %d", mIsCancel);
+    mIsCancel = 0;
+    LOGE("after cancel: %d", mIsCancel);
 }

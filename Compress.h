@@ -5,6 +5,14 @@
 #ifndef SMALLVIDEOVIEW_COMPRESS_H
 #define SMALLVIDEOVIEW_COMPRESS_H
 
-int compress(const char *in_filename, const char *out_filename);
+int compress(
+        const char *inFilename,
+        const char *outFilename,
+        long videoBitRate,
+        long audioBitRate,
+        int width,
+        int height);
+
+void cancelCompress();
 
 #endif //SMALLVIDEOVIEW_COMPRESS_H
